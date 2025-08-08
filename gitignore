@@ -1,0 +1,16 @@
+# Ignore venv / environment
+env/
+.venv/
+__pycache__/
+
+# Ignore ChromaDB (binary vector files)
+chroma_db/
+
+# Ignore Python cache
+*.pyc
+
+# Ignore Streamlit state
+.streamlit/
+
+# Ignore any .DS_Store (macOS)
+.DS_Store
