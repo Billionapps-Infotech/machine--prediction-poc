@@ -27,4 +27,7 @@ USER appuser
 EXPOSE 8501
 
 # Start Streamlit (change path if your file isn’t app.py at repo root)
-CMD ["streamlit", "run", "app.py"]
+CMD ["streamlit","run","app.py", "--server.port=8501",  "--server.address=0.0.0.0", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
+  CMD curl -f http://localhost:8501/_stcore/health || exit 1
