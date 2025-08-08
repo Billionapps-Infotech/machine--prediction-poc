@@ -16,6 +16,30 @@ st.set_page_config(page_title="Machine Failure Prediction POC", layout="wide")
 st.title("🔧 Machine Failure Prediction — POC")
 st.caption("Dataset: July 2024 → July 2025 · Forecast next 12 months")
 
+
+def _style_defect_rows(df_to_style, defect_col="Defect"):
+    import pandas as _pd
+    import numpy as _np
+    def row_style(row):
+        is_defect = str(row.get(defect_col, "")) != "No Failure"
+        if is_defect:
+            return ["background-color: #ffe9e9; font-weight: 600;" for _ in row]
+        else:
+            return ["" for _ in row]
+    try:
+        return df_to_style.style.apply(row_style, axis=1)
+    except Exception:
+        return df_to_style
+
+def _preview_right(df_original):
+    st.markdown("### 📄 Preview source data (Jul 2024 → Jul 2025)")
+    order = st.radio("Sort by month", ["Ascending", "Descending"], horizontal=True, index=0)
+    view = df_original.copy()
+    view["date"] = pd.to_datetime(view["date"])
+    view = view.sort_values("date", ascending=(order=="Ascending"))
+    st.dataframe(view.head(50), use_container_width=True)
+
+
 @st.cache_data
 def load_csv(path):
     return pd.read_csv(path)
@@ -184,7 +208,7 @@ if chosen_month != "All months":
     view = view[["Machine Name","predicted_defect","explanation","basis"]].rename(
         columns={"predicted_defect":"Defect","explanation":"Short Explanation","basis":"What this prediction is based on"}
     )
-    st.dataframe(view.reset_index(drop=True), use_container_width=True)
+    st.dataframe(_style_defect_rows(view.reset_index(drop=True)), use_container_width=True)
 else:
     st.markdown("### 🔮 Predictions (next 12 months) — by month")
     months_order = sorted(pred_df["month"].unique().tolist(), key=lambda s: pd.to_datetime("01-" + s, format="%d-%b-%Y"))
@@ -195,8 +219,12 @@ else:
         view = subset[["Machine Name","predicted_defect","explanation","basis"]].rename(
             columns={"predicted_defect":"Defect","explanation":"Short Explanation","basis":"What this prediction is based on"}
         ).reset_index(drop=True)
-        st.dataframe(view, use_container_width=True)
+        st.dataframe(_style_defect_rows(view), use_container_width=True)
 
 count_by_month = pred_df.groupby(["month","predicted_defect"]).size().reset_index(name="count")
 fig = px.bar(count_by_month, x="month", y="count", color="predicted_defect", barmode="stack", title="Predicted defects per month")
 st.plotly_chart(fig, use_container_width=True)
+
+
+# --- Right-side final section: preview original data ---
+_preview_right(df)
