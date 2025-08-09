@@ -1,12 +1,14 @@
 import os
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 import streamlit as st
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, precision_recall_fscore_support
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
 from sklearn.ensemble import RandomForestClassifier
 
 # ---------- Runtime TMP dir for CatBoost (fixes "Can't create train tmp dir: tmp")
@@ -20,19 +22,6 @@ try:
 except Exception:
     _USE_CAT = False
 
-# ---- Detailed explanations config ----
-USE_OPENAI_EXPLAIN = os.getenv("USE_OPENAI_EXPLAIN", "0") == "1"   # set to "1" to enable LLM rewrite
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-THRESH = {
-    "temperature_c": {"warn": 90, "high": 95},
-    "vibration_rms": {"warn": 0.95, "high": 1.10},
-    "pressure_bar": {"warn": 58, "high": 65},
-    "load_pct": {"warn": 0.75, "high": 0.85},
-    "run_hours": {"warn": 220, "high": 260},
-    "age_months": {"warn": 24, "high": 36},
-}
-
 st.set_page_config(page_title="Machine Failure Prediction POC", layout="wide")
 st.title("🔧 Machine Failure Prediction — POC")
 st.caption("Dataset: July 2024 → July 2025 · Forecast next 12 months")
@@ -44,21 +33,15 @@ def load_csv(path):
 def left_panel():
     st.sidebar.header("⬇️ Data (single dataset)")
     df = load_csv("data/sample_machine.csv")
-    st.sidebar.download_button(
-        "Download sample CSV",
-        df.to_csv(index=False).encode("utf-8"),
-        "sample_machine.csv",
-        "text/csv",
-    )
+    st.sidebar.download_button("Download sample CSV", df.to_csv(index=False).encode("utf-8"),
+                               "sample_machine.csv", "text/csv")
     uploaded = st.sidebar.file_uploader("Upload CSV (same columns)", type=["csv"])
     if uploaded is not None:
         try:
             up = pd.read_csv(uploaded)
-            required = {
-                "date","month","machine_id","age_months","ambient_temp_c","load_pct",
-                "run_hours","vibration_rms","pressure_bar","temperature_c",
-                "maintenance_overdue","defect_label"
-            }
+            required = {"date","month","machine_id","age_months","ambient_temp_c","load_pct",
+                        "run_hours","vibration_rms","pressure_bar","temperature_c",
+                        "maintenance_overdue","defect_label"}
             if required.issubset(up.columns):
                 df = up.copy()
             else:
@@ -74,13 +57,6 @@ def left_panel():
         value=True,
         help="If too many rows pick the same label in a month, flip a few to the 2nd-best class to keep examples varied."
     )
-    st.sidebar.markdown("---")
-    st.sidebar.caption("LLM rewrite of reasons (optional)")
-    enable_ai = st.sidebar.toggle("Use AI wording (OpenAI)", value=USE_OPENAI_EXPLAIN)
-    if enable_ai and not USE_OPENAI_EXPLAIN:
-        st.session_state["_use_ai_override"] = True
-    elif not enable_ai and USE_OPENAI_EXPLAIN:
-        st.session_state["_use_ai_override"] = False
     return df, summer_boost, diversity
 
 def build_features(df):
@@ -105,7 +81,7 @@ def _rf_model():
     )
 
 def train_model(df):
-    """Train CatBoost (preferred) with safe fallback to RandomForest. (Confusion-matrix removed)"""
+    """Train CatBoost (preferred) with safe fallback to RandomForest."""
     df = df.sort_values(["machine_id","date"]).reset_index(drop=True)
     X = build_features(df); y = df["defect_label"].values
     le = LabelEncoder(); y_enc = le.fit_transform(y)
@@ -146,15 +122,16 @@ def train_model(df):
     if not used_cat:
         model = _rf_model()
         model.fit(X_train, y_train)
+        # RF has predict_proba
         y_pred_test = model.predict(X_test)
 
-    # Keep basic metrics (no confusion matrix UI)
     report = classification_report(y_test, y_pred_test, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_test, y_pred_test, labels=np.unique(y_enc))
     acc = (y_pred_test==y_test).mean()
     p, r, f1, _ = precision_recall_fscore_support(y_test, y_pred_test, average="macro", zero_division=0)
     metrics = {"accuracy": acc, "macro_precision": p, "macro_recall": r, "macro_f1": f1}
 
-    return model, le, feats, pd.DataFrame(report).T.reset_index().rename(columns={"index":"metric"}), metrics, np.unique(y_enc)
+    return model, le, feats, pd.DataFrame(report).T.reset_index().rename(columns={"index":"metric"}), cm, metrics, np.unique(y_enc)
 
 def generate_future(df, months_ahead=12, summer_boost=4.0):
     last_date = pd.to_datetime(df["date"]).max()
@@ -192,86 +169,79 @@ def generate_future(df, months_ahead=12, summer_boost=4.0):
             })
     return pd.DataFrame(rows)
 
-# ---------- Explanation helpers ----------
-def _badge(value, warn, high, unit=""):
+def _basis_from_prediction(row, label):
+    reasons = []
+    temp = row.get("temperature_c", 0)
+    vib = row.get("vibration_rms", 0)
+    load = row.get("load_pct", 0)
+    press = row.get("pressure_bar", 0)
+    maint = row.get("maintenance_overdue", 0)
+    runh = row.get("run_hours", 0)
     try:
-        v = float(value)
+        mnum = int(pd.to_datetime(row.get("date", None)).month)
     except Exception:
-        v = value
-    try:
-        if v >= high: return f"{v}{unit} (≫{high}{unit})"
-        if v >= warn: return f"{v}{unit} (≥{warn}{unit})"
-    except Exception:
-        return f"{v}{unit}"
-    return f"{v}{unit}"
-
-def _explain_local(row, label, top3_text):
-    t = THRESH
-    parts = []
-
-    tc = float(row.get("temperature_c", np.nan))
-    vib = float(row.get("vibration_rms", np.nan))
-    load = float(row.get("load_pct", np.nan))
-    press = float(row.get("pressure_bar", np.nan))
-    runh = float(row.get("run_hours", np.nan))
-    age  = float(row.get("age_months", np.nan))
-    maint = int(row.get("maintenance_overdue", 0))
-
-    parts.append(f"Top3={top3_text}")
+        mnum = None
 
     if label == "Over Heating":
-        parts.append(f"Temperature {_badge(tc, **t['temperature_c'], unit='°C')} under load {_badge(load, **t['load_pct'])}.")
-        if maint: parts.append("Maintenance overdue may reduce cooling performance.")
+        if temp >= 95: reasons.append("very high operating temperature")
+        if load >= 0.8: reasons.append("sustained high load")
+        if maint == 1: reasons.append("maintenance overdue")
     elif label == "Electrical Fault":
-        parts.append(f"Electrical load {_badge(load, **t['load_pct'])}; temperature {_badge(tc, **t['temperature_c'], unit='°C')}.")
-        if runh >= t['run_hours']['warn']: parts.append(f"Run hours {_badge(runh, **t['run_hours'])}.")
-        if maint: parts.append("Maintenance overdue.")
+        if load >= 0.75: reasons.append("high electrical load")
+        if temp >= 90: reasons.append("elevated temperature")
+        if runh >= 220: reasons.append("heavy run hours")
+        if maint == 1 and len(reasons) < 3: reasons.append("maintenance overdue")
     elif label == "Hydraulic Failure":
-        parts.append(f"Hydraulic pressure {_badge(press, **t['pressure_bar'])}.")
-        if maint: parts.append("Maintenance overdue (fluids/filters).")
+        if press >= 60: reasons.append("high hydraulic pressure")
+        if (mnum in (12,1,2)) and len(reasons) < 3: reasons.append("cold season")
+        if maint == 1 and len(reasons) < 3: reasons.append("maintenance overdue")
     elif label == "Mechanical Wear":
-        parts.append(f"Vibration {_badge(vib, **t['vibration_rms'])}; age {_badge(age, **t['age_months'])} months.")
-        if runh >= t['run_hours']['warn']: parts.append(f"Run hours {_badge(runh, **t['run_hours'])}.")
+        if vib >= 1.0: reasons.append("elevated vibration")
+        if runh >= 240 and len(reasons) < 3: reasons.append("heavy run hours")
+        if row.get("age_months", 0) >= 24 and len(reasons) < 3: reasons.append("advanced component age")
     else:  # No Failure
-        normals = []
-        if tc   < t['temperature_c']['warn']: normals.append(f"temp {tc}°C")
-        if vib  < t['vibration_rms']['warn']: normals.append(f"vibration {vib}")
-        if press< t['pressure_bar']['warn']:  normals.append(f"pressure {press} bar")
-        baseline = ", ".join(normals[:3]) or "historical stability"
-        parts.append(f"Conditions normal: {baseline}.")
-    return " ".join(parts)
+        healthy = []
+        if temp < 90: healthy.append("normal temperature")
+        if vib < 1.0: healthy.append("stable vibration")
+        if press < 60: healthy.append("normal pressure")
+        if not healthy: healthy = ["historical stability"]
+        return ", ".join(healthy[:3])
 
-def _explain_with_openai(label, local_text):
-    # runtime toggle via sidebar overrides env
-    use_ai = st.session_state.get("_use_ai_override", None)
-    if use_ai is None:
-        use_ai = USE_OPENAI_EXPLAIN
-    if not use_ai:
-        return None
+    if not reasons and label != "No Failure":
+        scores = [
+            ("elevated vibration", (vib-0.8)),
+            ("sustained high load", (load-0.7)*2),
+            ("high hydraulic pressure", (press-58)/5),
+            ("heavy run hours", (runh-220)/50),
+            ("maintenance overdue", 0.5 if maint==1 else -1),
+            ("elevated temperature", (temp-90)/10),
+        ]
+        scores = sorted(scores, key=lambda x: x[1], reverse=True)
+        reasons = [name for name, sc in scores if sc > 0][:2]
+
+    if not reasons:
+        reasons = ["historical trends & seasonality"]
+    return ", ".join(reasons[:3])
+
+def _format_top3(p, classes):
+    order = np.argsort(p)[::-1][:3]
+    return ", ".join([f"{classes[i]} ({p[i]*100:.0f}%)" for i in order])
+
+def _style_rows_with_confidence(df_to_style, defect_col="Defect", conf_col="Max Prob"):
+    def to_style(row):
+        label = str(row.get(defect_col, "")); conf = float(row.get(conf_col, 0))
+        if label != "No Failure":
+            alpha = 0.15 + 0.55*min(1.0,max(0.15,conf))
+            return [f"background-color: rgba(255,82,82,{alpha}); font-weight: 600;" for _ in row]
+        else:
+            alpha = 0.10 + 0.4*min(1.0,max(0.1,conf))
+            return [f"background-color: rgba(46,204,113,{alpha}); font-weight: 500;" for _ in row]
     try:
-        from openai import OpenAI
-        client = OpenAI()  # needs OPENAI_API_KEY
-        prompt = (
-            "Turn these telemetry facts into a single short explanation (<=30 words) "
-            "for why the predicted defect might occur. Keep the key numbers. Do not hedge.\n"
-            f"Defect: {label}\nFacts: {local_text}"
-        )
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=80,
-        )
-        return resp.choices[0].message.content.strip()
+        return df_to_style.style.apply(to_style, axis=1)
     except Exception:
-        return None
+        return df_to_style
 
-def detailed_explanation(row, label, top3_text):
-    local = _explain_local(row, label, top3_text)
-    ai = _explain_with_openai(label, local)
-    return ai or local
-
-# ---------- UI & predictions ----------
+# ---------- UI
 df, summer_boost, diversity = left_panel()
 
 st.markdown("### 📅 Forecast Horizon")
@@ -282,7 +252,7 @@ months = ["All months"] + list(pd.date_range(
 chosen_month = st.selectbox("Select month to highlight", months, index=1)
 
 with st.spinner("Training model and generating predictions..."):
-    model, le, feats, report_df, metrics, label_ids = train_model(df)
+    model, le, feats, report_df, cm, metrics, label_ids = train_model(df)
     future = generate_future(df, 12, summer_boost)
     Xf = build_features(future)
     proba = model.predict_proba(Xf[feats])
@@ -310,27 +280,22 @@ def diversify(pred_idx, proba, months, threshold=0.6):
 y_idx_div = diversify(y_idx, proba, Xf["month"].values) if diversity else y_idx
 y_pred = classes[y_idx_div]
 
-pred_df = Xf[["date","month","machine_id","age_months","temperature_c","vibration_rms",
+pred_df = Xf[["date","month","machine_id","temperature_c","vibration_rms",
               "load_pct","pressure_bar","run_hours","maintenance_overdue"]].copy()
 pred_df["predicted_defect"] = y_pred
 pred_df["max_prob"] = proba[np.arange(len(proba)), y_idx_div]
-pred_df["top3"] = [
-    ", ".join([f"{classes[i]} ({proba[j,i]*100:.0f}%)"
-               for i in np.argsort(proba[j])[::-1][:3]])
-    for j in range(len(pred_df))
-]
+pred_df["top3"] = [_format_top3(proba[i], classes) for i in range(len(pred_df))]
+pred_df["basis"] = pred_df.apply(lambda r: _basis_from_prediction(r, r["predicted_defect"]), axis=1)
 
-# Detailed, numeric explanations (optional OpenAI rewrite)
-basis_inputs = pred_df[[
-    "temperature_c","vibration_rms","load_pct","pressure_bar",
-    "run_hours","age_months","maintenance_overdue"
-]].to_dict(orient="records")
-pred_df["basis"] = [
-    detailed_explanation(basis_inputs[i],
-                         pred_df.iloc[i]["predicted_defect"],
-                         pred_df.iloc[i]["top3"])
-    for i in range(len(pred_df))
-]
+with st.expander("📊 Model validation — confusion matrix & metrics", expanded=False):
+    st.dataframe(report_df, use_container_width=True)
+    labels_text = le.inverse_transform(label_ids)
+    fig = go.Figure(data=go.Heatmap(z=cm, x=labels_text, y=labels_text, colorscale="Blues",
+                                    text=cm, texttemplate="%{text}", showscale=True))
+    fig.update_layout(title="Confusion Matrix (rows=actual, cols=predicted)",
+                      xaxis_title="Predicted", yaxis_title="Actual")
+    st.plotly_chart(fig, use_container_width=True)
+    st.write({k: round(v,3) for k,v in metrics.items()})
 
 # ---------- Views
 if chosen_month != "All months":
@@ -340,18 +305,7 @@ if chosen_month != "All months":
     view = view[["Machine Name","predicted_defect","top3","basis","max_prob"]].rename(
         columns={"predicted_defect":"Defect","top3":"Top probabilities",
                  "basis":"What this prediction is based on","max_prob":"Max Prob"})
-    st.dataframe(
-        view.style.apply(
-            lambda r: [
-                "background-color: rgba(255,82,82,0.25); font-weight:600;"
-                if r["Defect"]!="No Failure" else
-                "background-color: rgba(46,204,113,0.2); font-weight:500;"
-                for _ in r
-            ],
-            axis=1
-        ),
-        use_container_width=True
-    )
+    st.dataframe(_style_rows_with_confidence(view), use_container_width=True)
 else:
     st.markdown("### 🔮 Predictions (next 12 months) — by month")
     for m in sorted(pred_df["month"].unique(),
@@ -362,18 +316,7 @@ else:
         view = subset[["Machine Name","predicted_defect","top3","basis","max_prob"]].rename(
             columns={"predicted_defect":"Defect","top3":"Top probabilities",
                      "basis":"What this prediction is based on","max_prob":"Max Prob"})
-        st.dataframe(
-            view.style.apply(
-                lambda r: [
-                    "background-color: rgba(255,82,82,0.25); font-weight:600;"
-                    if r["Defect"]!="No Failure" else
-                    "background-color: rgba(46,204,113,0.2); font-weight:500;"
-                    for _ in r
-                ],
-                axis=1
-            ),
-            use_container_width=True
-        )
+        st.dataframe(_style_rows_with_confidence(view), use_container_width=True)
 
 # ---------- Preview (bound/independent)
 st.markdown("### 📄 Preview source data (Jul 2024 → Jul 2025)")
